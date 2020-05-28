@@ -1,10 +1,10 @@
-import pyeapi
 from cvprac.cvp_client import CvpClient
 from cvprac.cvp_client_errors import CvpApiError
 #Disables no certificate CVP warning
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import json, re, csv
+import argparse
 from getpass import getpass
 
 def updateInCVP(cvp, name, config, serial_number, apply=True):
@@ -111,7 +111,7 @@ def updateInCVP(cvp, name, config, serial_number, apply=True):
         except:
             return []
 
-def deploy_device_with_no_configlets(cvp, device_dict, target_container, mgmt_configlet_name):
+def deploy_device_with_no_configlets(cvp, device_dict, target_container, image_bundle, include_container_configlets=False):
     '''
         Creates a static configlet of the reconcile config produced as if no configlets are applied to the device
         Then deploys device into proper container based off of first three characters of device hostname and applies previously generated configlet
@@ -135,23 +135,40 @@ def deploy_device_with_no_configlets(cvp, device_dict, target_container, mgmt_co
     print("{} - Got device information".format(device_dict["hostname"]))
 
     #keys of configlets we'll pretend are applied to a device when we generate a reconcile config
-    container_configlet_keys = [ configlet["key"] for configlet in cvp.api.get_configlets_inherited_from_containers(target_container) ]
+    if include_container_configlets == True:
+        container_configlet_keys = [ configlet["key"] for configlet in cvp.api.get_configlets_inherited_from_containers(target_container) ]
+    else:
+        container_configlet_keys = []
+
     configlets_to_generate_reconcile = container_configlet_keys
-    try:
-        mgmt_configlet = cvp.api.get_configlet_by_name(mgmt_configlet_name)
-    except:
-        mgmt_configlet = None
-    if mgmt_configlet is not None:
-        configlets_to_generate_reconcile.append(mgmt_configlet["key"])
-        configlets_to_apply.append(mgmt_configlet)
 
     #Generate consolidated configlet
     print ("{} - Generating configlet configuration...".format(device_dict["hostname"]))
     validate_response = cvp.api.validate_configlets_for_device(device_id, configlets_to_generate_reconcile,
-                                       page_type='viewConfig')
+                                       page_type='validate')
 
-    if "config" in validate_response["reconciledConfig"].keys():
-        config = validate_response["reconciledConfig"]["config"]
+    if "runningConfig" in validate_response.keys():
+        config = []
+        for line in validate_response["runningConfig"]:
+            if include_container_configlets == True:
+                if line["command"] == "!":
+                    config.append(line["command"])
+                elif line["shouldReconcile"] == True:
+                    config.append(line["command"])
+                else:
+                    continue
+            else:
+                config.append(line["command"])
+
+        # Parse out duplicate '!'s
+        parsed_config = []
+        for i, line in enumerate(config):
+            if i != 0:
+                if not(line == "!" and config[i-1] == "!"):
+                    parsed_config.append(line)
+        config = parsed_config
+
+        config = "\n".join(config)
     else:
         print("{} - No reconcile configlet to generate.".format(device_dict["hostname"]))
         return
@@ -175,61 +192,21 @@ def deploy_device_with_no_configlets(cvp, device_dict, target_container, mgmt_co
         print("{} - Could not find configlet named {}".format(configlet_name, device_dict["hostname"]))
         return
 
-    if cvp.api.get_container_by_name(target_container) is None:
-        print("{} - Could not find destination container for {}".format(device_dict["hostname"], device_dict["hostname"]))
-        return
-
-    # print("Device ID -> {}".format(device_dict))
-    # print("Target container -> {}".format(target_container))
-    # print("Configlets to apply -> {}".format(configlets_to_apply))
-
-    cvp.api.deploy_device(device_dict, target_container, configlets=configlets_to_apply)
-
+    if device_dict["parentContainerKey"] != "undefined_container":
+        #Get already applied configlets at device level
+        device_level_configlets = cvp.api.get_configlets_by_netelement_id(device_id)["configletList"]
+        cvp.api.remove_configlets_from_device("Removed by script", device_dict, device_level_configlets)
+        cvp.api.apply_configlets_to_device("Added by script", device_dict, configlets_to_apply)
+    else:
+        if target_container != "" and cvp.api.get_container_by_name(target_container) is None:
+            print("{} - Could not find destination container for {}".format(device_dict["hostname"], device_dict["hostname"]))
+            return
+        
+        if image_bundle != "" and cvp.api.get_image_bundle_by_name(image_bundle) is None:
+            print("{} - Could not find image bundle for {}".format(device_dict["hostname"], device_dict["hostname"]))
+            return
+        cvp.api.deploy_device(device_dict, target_container, configlets=configlets_to_apply, image=image_bundle)
     return
-
-def create_mgmt_configlet(cvp, hostname, mgmt_interface, mgmt_ip, default_gateway, mgmt_vrf="default"):
-    #Give name to management configlet
-    configlet_name = hostname + "_MGMT"
-    #Create configuration for managment configlet
-    configlet_content = []
-    configlet_content.append("hostname {}".format(hostname))
-    configlet_content.append("!")
-    if mgmt_vrf is not None and mgmt_vrf != "default":
-        configlet_content.append("vrf instance {}".format(mgmt_vrf))
-        configlet_content.append("   rd 1:1")
-        configlet_content.append("!")
-    configlet_content.append("interface {}".format(mgmt_interface))
-    if mgmt_vrf is not None and mgmt_vrf != "default":
-        configlet_content.append("   vrf {}".format(mgmt_vrf))
-    configlet_content.append("   ip address {}".format(mgmt_ip))
-    configlet_content.append("!")
-    if mgmt_vrf is not None and mgmt_vrf != "default":
-        configlet_content.append("ip route vrf {} 0.0.0.0/0 {}".format(mgmt_vrf, default_gateway))
-    else:
-        configlet_content.append("ip route 0.0.0.0/0 {}".format(default_gateway))
-    configlet_content.append("!")
-    configlet_content.append("ip routing")
-    if mgmt_vrf is not None and mgmt_vrf != "default":
-        configlet_content.append("no ip routing vrf {}".format(mgmt_vrf))
-    configlet_content.append("!")
-    configlet_content.append("management api http-commands")
-    configlet_content.append("   no shutdown")
-    if mgmt_vrf is not None and mgmt_vrf != "default":
-        configlet_content.append("   !")
-        configlet_content.append("   vrf {}".format(mgmt_vrf))
-        configlet_content.append("      no shutdown")
-    configlet_content.append("!")
-    configlet_content = "\n".join(configlet_content)
-    #Create/Update Configlet in CVP
-    try:
-        existing_mgmt_configlet = cvp.api.get_configlet_by_name(configlet_name)
-    except Exception:
-        existing_mgmt_configlet = None
-    if existing_mgmt_configlet is None:
-        cvp.api.add_configlet(configlet_name, configlet_content)
-    else:
-        cvp.api.update_configlet(configlet_content, existing_mgmt_configlet["key"], configlet_name)
-    return configlet_name
 
 def parse_switch_info_file(switch_info_file):
     switches = {} #Using serial number as key
@@ -245,49 +222,38 @@ def parse_switch_info_file(switch_info_file):
                 for col in range(len(attributes)):
                     switch_info[attributes[col]] = row[col]
                 switches[switch_info["Hostname"]] = {
-                    "Management VRF": switch_info["Management VRF"],
-                    "Target Container": switch_info["Target Container"],
-                    "Default Gateway": switch_info["Default Gateway"],
-                    "IP Address": switch_info["Management IP Address"]
+                    "Target Container": switch_info["Target Container"].strip(),
+                    "Image Bundle": switch_info["Image Bundle"].strip()
                 }
                 line_count += 1
     return switches
 
-def get_mgmt_switch_info(ip_address, username, password, mgmt_vrf="default"):
-    switch = pyeapi.connect(host=ip_address, username=username, password=password)
-    if mgmt_vrf != "default":
-        management_interface_config = switch.execute(["show ip route vrf {} 0.0.0.0/0".format(mgmt_vrf)])["result"][0]
-    else:
-        management_interface_config = switch.execute(["show ip route 0.0.0.0/0"])["result"][0]
-    if len(management_interface_config["vrfs"][mgmt_vrf]["routes"]["0.0.0.0/0"]["vias"]) > 0:
-        mgmt_gateway = management_interface_config["vrfs"][mgmt_vrf]["routes"]["0.0.0.0/0"]["vias"][0]["nexthopAddr"]
-        mgmt_interface = management_interface_config["vrfs"][mgmt_vrf]["routes"]["0.0.0.0/0"]["vias"][0]["interface"]
-    else:
-        mgmt_gateway = None
-        mgmt_interface = None
-    
-    if mgmt_interface is not None:
-        mgmt_interface = "Management 1"
-    
-    interface_config = switch.execute(["show interfaces {}".format(mgmt_interface)])["result"][0]
-    if len(interface_config["interfaces"][mgmt_interface.replace(" ", "")]["interfaceAddress"]) > 0:
-        mgmt_address_ip = interface_config["interfaces"][mgmt_interface.replace(" ", "")]["interfaceAddress"][0]["primaryIp"]["address"]
-        mgmt_address_mask = interface_config["interfaces"][mgmt_interface.replace(" ", "")]["interfaceAddress"][0]["primaryIp"]["maskLen"]
-        mgmt_address = mgmt_address_ip + "/" + str(mgmt_address_mask)
-    else:
-        mgmt_address = None
-    
-    return {"Management Interface": mgmt_interface, "Management IP Address": mgmt_address, "Default Gateway": mgmt_gateway}
+def parseArgs():
+    parser = argparse.ArgumentParser(
+        description='Provisions devices in CVP')
 
+    parser.add_argument('-u', '--user', help="Username for CVP user")
+    parser.add_argument('-p', '--password', default=None, help="Password for CVP user")
+    parser.add_argument('-i', '--inventory', help="path to switch management details file")
+    parser.add_argument('-host', '--cvp', help="CVP node IP Addresses separated by commas")
+
+    args = parser.parse_args()
+
+    return args
 
 def main():
-    switch_info_dict = parse_switch_info_file("switch_mgmt_details.csv")
-    username = "cvpadmin"
-    password = getpass("Password:")
-    cvp_addresses = ["10.20.30.185"]
+    args = parseArgs()
+    username = args.user
+    password = args.password
+    if password is None:
+        print("Please provide a password for the user {}".format(username))
+        password = getpass("Password:")
+    cvp_addresses = [ address.strip() for address in  args.cvp.split(",") ]
+    inventory = args.inventory
+
     cvp = CvpClient()
     cvp.connect(cvp_addresses, username, password)
-    inventory = cvp.api.get_devices_in_container("Undefined")
+    inventory = cvp.api.get_inventory()
     for switch in inventory:
         #Check to see if switch in spreadsheet and get VRF 
         try:
@@ -295,19 +261,7 @@ def main():
         except KeyError:
             print("Could not find {}'s serial number in spreadsheet".format(switch["hostname"]))
             continue
-
-        #Parse switch details
-        target_container = switch_details["Target Container"]# "DC2-Leafs"#Get target container
-        mgmt_interface = "Management1" 
-        mgmt_ip = switch_details["Management IP Address"]    # switch["ipAddress"] + "/24"
-        default_gateway = switch_details["Default Gateway"] # "10.20.30.254"
-        mgmt_vrf = switch_details["Management VRF"]   # "MGMT"
-
-        management_configlet_name = create_mgmt_configlet(cvp, switch["hostname"], mgmt_interface, mgmt_ip,
-                                                            default_gateway, mgmt_vrf=mgmt_vrf)
-
-        deploy_device_with_no_configlets(cvp, switch, target_container, management_configlet_name)
-        break
+        deploy_device_with_no_configlets(cvp, switch, switch_details["Target Container"], switch_details["Image Bundle"], include_container_configlets=True)
 
 if __name__ == "__main__":
     main()
