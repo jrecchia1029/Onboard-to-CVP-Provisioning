@@ -31,9 +31,13 @@ optional arguments:
   -p PASSWORD, --password PASSWORD
                         Password for CVP user
   -i INVENTORY, --inventory INVENTORY
-                        path to switch management details file
+                        Path to switch management details file
   -host CVP, --cvp CVP  CVP node IP Addresses separated by commas
 ```
+
+An example for how to execute the script is below:
+
+`python main.py --user <username> --password <password> --cvp <cvp-ip-address> --inventory <path-to-inventory-file>`
 
 - Note that if you do not wish to enter a password value in plain text, you may leave the password field out of the initial execution command and will be prompted for it when the script is executing.
 
