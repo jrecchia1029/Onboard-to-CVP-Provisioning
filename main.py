@@ -142,6 +142,8 @@ def deploy_device_with_no_configlets(cvp, device_dict, target_container, image_b
 
     configlets_to_generate_reconcile = container_configlet_keys
 
+    print("configlets_to_generate_reconcile: {}".format(configlets_to_generate_reconcile))
+
     #Generate consolidated configlet
     print ("{} - Generating configlet configuration...".format(device_dict["hostname"]))
     validate_response = cvp.api.validate_configlets_for_device(device_id, configlets_to_generate_reconcile,
@@ -149,17 +151,22 @@ def deploy_device_with_no_configlets(cvp, device_dict, target_container, image_b
 
     if "runningConfig" in validate_response.keys():
         config = []
-        for line in validate_response["runningConfig"]:
+        for i, line in enumerate(validate_response["runningConfig"]):
+            if "vrf" in line["command"]:
+                print(line)
+
             if include_container_configlets == True:
                 if line["command"] == "!":
                     config.append(line["command"])
-                elif line["shouldReconcile"] == True:
+                elif line["code"] == "RED":
+                    config.append(line["command"])
+                elif re.match(r'interface (Ethernet|Management).+', line["command"]) is not None:
                     config.append(line["command"])
                 else:
                     continue
             else:
                 config.append(line["command"])
-
+        
         # Parse out duplicate '!'s
         parsed_config = []
         for i, line in enumerate(config):
@@ -249,8 +256,8 @@ def main():
         print("Please provide a password for the user {}".format(username))
         password = getpass("Password:")
     cvp_addresses = [ address.strip() for address in  args.cvp.split(",") ]
-    inventory = args.inventory
-
+    inventory_file = args.inventory
+    switch_info_dict = parse_switch_info_file(inventory_file)
     cvp = CvpClient()
     cvp.connect(cvp_addresses, username, password)
     inventory = cvp.api.get_inventory()
